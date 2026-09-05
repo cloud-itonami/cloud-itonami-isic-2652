@@ -1,208 +1,205 @@
 (ns watchmfg.render-html
-  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+  "Build-time HTML renderer for the operator console.
 
-  Closes flagship checklist item 2 (com-junkawasaki/root ADR-2607189300):
-  this repo previously had NO demo page and no generator at all.
+  Drives the REAL WatchOperationActor (`watchmfg.operation/build` -> a
+  compiled langgraph-clj StateGraph) over the REAL seeded store
+  (`watchmfg.store/sample-data!`), through the REAL Watch & Clock Plant
+  Operations Governor (`watchmfg.governor/check`) and the REAL rollout
+  phase gate (`watchmfg.phase/gate`), and renders whatever those
+  produced. Nothing on the page is written by hand:
 
-  This namespace drives the REAL actor stack -- `watchmfg.operation`
-  (a langgraph-clj StateGraph) -> `watchmfg.governor` ->
-  `watchmfg.phase` -> `watchmfg.store` -- through a scenario adapted
-  from this repo's own `watchmfg.sim` demo driver (`clojure -M:dev:run`,
-  run and read BEFORE writing this file, so the ids below are this
-  repo's OWN seeded ids: batches `batch-001`..`batch-003`, equipment
-  `assembly-001` / `test-bench-002`). Every id, number, disposition and
-  hold reason on the rendered page is read back out of the resulting
-  store + append-only ledger. Nothing on the page is a literal that was
-  typed by hand:
+    - every table row is read back out of the store after the run
+      (`store/ledger`, `store/all-batches`, `store/all-equipment`,
+      `store/all-maintenance`, `store/shipment`,
+      `store/safety-concerns`, `store/maintenance-history`,
+      `store/shipment-history`),
+    - every HARD-hold rule name and every violation detail string is
+      the governor's own `:violations` entry off the ledger fact --
+      never a literal in this namespace,
+    - the phase gate table is derived from `watchmfg.phase/phases`, and
+      the governor configuration / ground-truth bound tables from
+      `watchmfg.governor` and `watchmfg.registry` public vars.
 
-    - the batch/equipment tables are `store/all-batches` /
-      `store/all-equipment` after the run (so `:shipped-units` shows the
-      value the committed shipment actually moved, not the seed value);
-    - the gate table is derived from `governor/allowed-ops`,
-      `governor/allowed-proposal-effects`, `governor/high-stakes`,
-      `governor/confidence-floor` and `phase/phases` -- the actor's own
-      code data, not a prose description of it;
-    - the hold-reason table is a frequency count over the `:basis`
-      values the governor actually emitted this run;
-    - the draft records are `store/maintenance-history` /
-      `store/shipment-history` / `store/safety-concerns`.
+  The ONE piece of hand-written prose is each scenario's `:exercises`
+  string in `scenarios` below -- a static description of the fixed
+  op-gate contract being probed, not a claim about the run's outcome
+  (every outcome column beside it is the graph's own output).
 
-  DETERMINISM: this actor has no clock and no randomness -- maintenance
-  and shipment numbers come from `watchmfg.registry`'s zero-padded
-  monotonic sequence (`MNT-000000`, `SHP-000000`), the ledger is
-  append-only in scenario order, and `store/all-batches` /
-  `all-equipment` / `all-maintenance` sort by `:id`. Nothing derived
-  from wall-clock time is written into the page, so two runs from the
-  same seed are byte-identical. (Verified by diffing two consecutive
-  runs; see the ADR / commit message.)
+  Subject provenance (the demo may not invent subjects): every batch and
+  equipment id driven below is either seeded by `store/sample-data!`
+  (`batch-001` `batch-002` `batch-003` `assembly-001` `test-bench-002`)
+  or created by an intake op inside this demo itself -- `batch-004` is
+  created by the `t01` `:log-production-batch` commit, and every `mnt-*`
+  / `ship-*` / `concern-*` subject is the draft record that its own op
+  registers via `watchmfg.registry`.
 
-  BUILD-TIME INVARIANT: `-main` refuses to write the file if the
-  resulting ledger contains ZERO `:governor-hold` facts. The point of
-  this console is to show that HARD violations never reach a human, so a
-  page rendered from a run where the governor never fired would be a
-  demo of nothing. Making it a throw (precedent: cloud-itonami-isic-2513)
-  turns that from a convention into something the build enforces.
+  Fields rendered are only fields the domain model actually carries. In
+  particular `:approved-by` is NOT rendered on a committed shipment /
+  maintenance record: `watchmfg.operation`'s `:request-approval` node
+  puts the approver on the record's `:payload`, while
+  `store/commit-record!` persists `:value` -- so the approver is shown
+  from the run timeline (where it is real), not from the stored record
+  (where it does not exist).
 
-  Usage: `clojure -M:dev:render-html [out-file]`
-  (default `docs/samples/operator-console.html`)."
-  (:require [clojure.java.io :as io]
-            [clojure.string :as str]
+  Deterministic: no clock, no randomness, no network. Re-running writes
+  a byte-identical file.
+
+  Run: `clojure -M:dev:render-html [out-file]`
+  (default out-file `docs/samples/operator-console.html`)."
+  (:require [clojure.string :as str]
             [jp-go-dds.skin]
             [langgraph.graph :as g]
             [watchmfg.governor :as governor]
             [watchmfg.operation :as op]
             [watchmfg.phase :as phase]
+            [watchmfg.registry :as registry]
             [watchmfg.store :as store]))
 
-;; ----------------------------- scenario -----------------------------
+;; ----------------------------- the run -----------------------------
 
 (def ^:private coordinator
-  "The operator context every request in this scenario runs under --
-  the same shape `watchmfg.sim` uses. Phase 3 (`supervised-auto`) is
-  this actor's own `phase/default-phase`."
-  {:actor-id "coord-1" :actor-role :plant-coordinator :phase 3})
+  {:actor-id "coord-1" :actor-role :plant-coordinator :phase phase/default-phase})
 
-(defn- exec! [actor tid request]
-  (g/run* actor {:request request :context coordinator} {:thread-id tid}))
+(def ^:private scenarios
+  "One entry = one coordination request driven through the real actor.
+  `:approval`, when present, is the human decision handed back to the
+  paused graph (`interrupt-before #{:request-approval}`).
 
-(defn- resolve! [actor tid status]
-  (g/run* actor {:approval {:status status :by "coord-1"}}
-          {:thread-id tid :resume? true}))
+  `:exercises` is the only hand-written prose on the page: it states
+  which fixed rule of this repo's own op-gate contract the request
+  probes. Whether that rule actually fired is never asserted here --
+  the Governor / Human / Final columns beside it come from the graph."
+  [{:tid "t01"
+    :exercises "Intake of a NEW production batch. Governor-clean, and :log-production-batch is the one op in phase 3's :auto set -> auto-commit. batch-004 exists for the rest of this page only because this op created it."
+    :request {:op :log-production-batch :effect :propose :subject "batch-004"
+              :patch {:product-type :movement
+                      :model "MV-30"
+                      :accuracy-test-seconds-per-day 4.0
+                      :quantity-units 60.0
+                      :defect-rate-percent 1.2
+                      :last-assessed "2026-07-20"}}}
+
+   {:tid "t02"
+    :exercises "Maintenance window against a verified + registered movement-assembly station. Never auto-eligible at any phase -> escalates; the human plant supervisor approves."
+    :request {:op :schedule-maintenance :effect :propose :subject "mnt-1"
+              :value {:equipment-id "assembly-001"
+                      :maintenance-type :regulation-calibration
+                      :scheduled-date "2026-08-01"
+                      :actuate-equipment? false}}
+    :approval {:status :approved :by "coord-1"}}
+
+   {:tid "t03"
+    :exercises "Safety concern. Always high-stakes, so the governor escalates regardless of confidence; the human approves."
+    :request {:op :flag-safety-concern :effect :propose :subject "concern-1"
+              :value {:equipment-id "assembly-001" :severity :moderate
+                      :description "電池セルの液漏れ疑い、精度試験のばらつき"}}
+    :approval {:status :approved :by "coord-1"}}
+
+   {:tid "t04"
+    :exercises "Shipment against a verified + registered batch with headroom. Escalates; the human shipping approver approves and the batch's shipped-units advances."
+    :request {:op :coordinate-shipment :effect :propose :subject "ship-1"
+              :value {:batch-id "batch-001" :units 50.0
+                      :destination "buyer-yard-north"}}
+    :approval {:status :approved :by "coord-1"}}
+
+   {:tid "t05"
+    :exercises "Governor-clean shipment the human VETOES. Distinct from a HARD hold: the governor cleared it, a person did not."
+    :request {:op :coordinate-shipment :effect :propose :subject "ship-2"
+              :value {:batch-id "batch-002" :units 4.0
+                      :destination "buyer-yard-west"}}
+    :approval {:status :rejected :by "coord-1"}}
+
+   {:tid "t06"
+    :exercises "Shipment against batch-004 -- the batch t01 just created, which carries no verified?/registered? ground truth. HARD hold."
+    :request {:op :coordinate-shipment :effect :propose :subject "ship-3"
+              :value {:batch-id "batch-004" :units 10.0
+                      :destination "buyer-yard-north"}}
+    :approval {:status :approved :by "coord-1"}}
+
+   {:tid "t07"
+    :exercises "Shipment whose claimed units would push batch-002 past its own recorded production quantity. The governor recomputes from the batch's own fields. HARD hold."
+    :request {:op :coordinate-shipment :effect :propose :subject "ship-4"
+              :value {:batch-id "batch-002" :units 100.0
+                      :destination "buyer-yard-east"}}}
+
+   {:tid "t08"
+    :exercises "Maintenance against the seeded accuracy-test bench, which is neither inspected nor on file. HARD hold."
+    :request {:op :schedule-maintenance :effect :propose :subject "mnt-2"
+              :value {:equipment-id "test-bench-002"
+                      :maintenance-type :calibration
+                      :scheduled-date "2026-08-05"
+                      :actuate-equipment? false}}}
+
+   {:tid "t09"
+    :exercises "A maintenance proposal that tries to ACTUATE the movement-assembly station rather than draft a window. Permanent scope boundary -- never reaches a human. HARD hold."
+    :request {:op :schedule-maintenance :effect :propose :subject "mnt-3"
+              :value {:equipment-id "assembly-001" :maintenance-type :force-run
+                      :scheduled-date "2026-09-01"
+                      :actuate-equipment? true}}
+    :approval {:status :approved :by "coord-1"}}
+
+   {:tid "t10"
+    :exercises "The SAME maintenance window as t02, scheduled twice. Guarded off a dedicated :scheduled? fact, never a :status value. HARD hold."
+    :request {:op :schedule-maintenance :effect :propose :subject "mnt-1"
+              :value {:equipment-id "assembly-001"
+                      :maintenance-type :regulation-calibration
+                      :scheduled-date "2026-08-01"
+                      :actuate-equipment? false}}}
+
+   {:tid "t11"
+    :exercises "A batch patch declaring a product type outside the closed known set. HARD hold."
+    :request {:op :log-production-batch :effect :propose :subject "batch-003"
+              :patch {:product-type :unobtainium}}}
+
+   {:tid "t12"
+    :exercises "A batch patch with a rate-test reading far outside any physically plausible accuracy test. HARD hold."
+    :request {:op :log-production-batch :effect :propose :subject "batch-003"
+              :patch {:accuracy-test-seconds-per-day 999999.0}}}
+
+   {:tid "t13"
+    :exercises "A batch patch claiming a defect rate above 100%. HARD hold."
+    :request {:op :log-production-batch :effect :propose :subject "batch-003"
+              :patch {:defect-rate-percent 480.0}}}
+
+   {:tid "t14"
+    :exercises "A patch trying to self-issue a chronometer/accuracy certification mark (COSC under ISO 3159). Authority this actor never holds -- permanent. HARD hold."
+    :request {:op :log-production-batch :effect :propose :subject "batch-001"
+              :patch {:issue-certification? true}}
+    :approval {:status :approved :by "coord-1"}}
+
+   {:tid "t15"
+    :exercises "A mis-wired caller whose own request :effect is not :propose -- checked before anything else. HARD hold."
+    :request {:op :log-production-batch :effect :direct-write :subject "batch-001"
+              :patch {:product-type :automatic-watch}}}
+
+   {:tid "t16"
+    :exercises "An op outside the closed allowlist. Both the op allowlist and the proposal-effect allowlist reject it. HARD hold."
+    :request {:op :actuate-movement-line :effect :propose :subject "batch-001"}}])
+
+(defn- drive!
+  "Runs one scenario through the real compiled graph and returns the
+  scenario enriched with what the graph actually did."
+  [actor {:keys [tid request approval] :as scenario}]
+  (let [r1 (g/run* actor {:request request :context coordinator} {:thread-id tid})
+        paused? (= :interrupted (:status r1))
+        r2 (when (and approval paused?)
+             (g/run* actor {:approval approval} {:thread-id tid :resume? true}))
+        final (:state (or r2 r1))
+        audit (:audit final [])]
+    (assoc scenario
+           :verdict (:verdict final)
+           :paused? paused?
+           :escalation (first (filter #(= :approval-requested (:t %)) audit))
+           :human (when r2 (:status approval))
+           :disposition (:disposition final))))
 
 (defn run-demo!
-  "Runs a fresh seeded store through a scenario that reaches EVERY
-  disposition this actor can produce, so the console shows all of them
-  side by side.
-
-  CLEAN / APPROVED paths:
-    - `:log-production-batch` on batch-001 with a clean patch --
-      governor-clean, high confidence, and `:log-production-batch` is
-      the single member of phase 3's `:auto` set, so it AUTO-COMMITS
-      with no human in the loop;
-    - `:schedule-maintenance` mnt-1 against assembly-001 (verified +
-      registered movement-assembly station) -- governor-clean but
-      NEVER auto-eligible at any phase, so it escalates and a human
-      plant supervisor approves;
-    - `:flag-safety-concern` concern-1 -- always `:stake
-      :coordination/safety-concern`, so the governor escalates it
-      regardless of confidence; approved;
-    - `:coordinate-shipment` ship-1 for 50.0 units of batch-001
-      (500.0 produced, 100.0 already shipped -- real headroom) --
-      escalates, approved, and the commit moves batch-001's own
-      `:shipped-units` to 150.0 (visible in the rendered table).
-
-  HUMAN-REJECTED path (SOFT hold -- a human DID see it and said no):
-    - `:flag-safety-concern` concern-2 escalates and the approver
-      rejects, producing an `:approval-rejected` fact.
-
-  HARD holds (the governor rejects outright -- these NEVER reach a
-  human, no phase and no approval can override them). One request per
-  rule, exercising each failure mode directly rather than only via a
-  happy path -- all twelve HARD checks in `watchmfg.governor`:
-    - `:not-propose-effect`               mis-wired caller, request
-                                          `:effect :direct-write`
-    - `:unknown-op` (+ `:equipment-control-blocked`)
-                                          `:actuate-movement-line`
-    - `:equipment-not-verified`           mnt-2 vs UNVERIFIED
-                                          test-bench-002
-    - `:batch-not-verified`               ship-2 vs UNVERIFIED batch-003
-    - `:shipment-quantity-exceeded`       ship-3, 100.0 units on
-                                          batch-002 (200.0 produced,
-                                          180.0 already shipped)
-    - `:equipment-actuate-blocked`        mnt-3 with
-                                          `:actuate-equipment? true`
-    - `:already-scheduled`                mnt-1 a second time
-    - `:invalid-product-type`             fabricated `:unobtainium`
-    - `:invalid-accuracy-test-seconds-per-day`  999999.0 s/day
-    - `:invalid-defect-rate`              999.0 %
-    - `:certification-authority-blocked`  `:issue-certification? true`
-
-  Returns the store. Every field `render` reads is real governor /
-  store output."
+  "Seeds a MemStore, builds the real actor, drives every scenario.
+  Returns {:db store :runs [..]}."
   []
   (let [db (-> (store/mem-store) (store/sample-data!))
         actor (op/build db)]
-
-    ;; --- clean / approved ------------------------------------------------
-    (exec! actor "b1-log"
-           {:op :log-production-batch :effect :propose :subject "batch-001"
-            :patch {:product-type :automatic-watch :last-assessed "2026-07-14"}})
-
-    (exec! actor "mnt-1-schedule"
-           {:op :schedule-maintenance :effect :propose :subject "mnt-1"
-            :value {:equipment-id "assembly-001" :maintenance-type :regulation-calibration
-                    :scheduled-date "2026-08-01" :actuate-equipment? false}})
-    (resolve! actor "mnt-1-schedule" :approved)
-
-    (exec! actor "concern-1-flag"
-           {:op :flag-safety-concern :effect :propose :subject "concern-1"
-            :value {:equipment-id "assembly-001" :severity :moderate
-                    :description "電池セルの液漏れ疑い、精度試験のばらつき"}})
-    (resolve! actor "concern-1-flag" :approved)
-
-    (exec! actor "ship-1-coordinate"
-           {:op :coordinate-shipment :effect :propose :subject "ship-1"
-            :value {:batch-id "batch-001" :units 50.0
-                    :destination "buyer-yard-north"}})
-    (resolve! actor "ship-1-coordinate" :approved)
-
-    ;; --- SOFT hold: escalated to a human, human said no -------------------
-    (exec! actor "concern-2-flag"
-           {:op :flag-safety-concern :effect :propose :subject "concern-2"
-            :value {:equipment-id "test-bench-002" :severity :low
-                    :description "精度試験ベンチの参照時計のずれ疑い(未検証機)"}})
-    (resolve! actor "concern-2-flag" :rejected)
-
-    ;; --- HARD holds: never reach a human ---------------------------------
-    (exec! actor "h-not-propose"
-           {:op :log-production-batch :effect :direct-write :subject "batch-001"
-            :patch {:product-type :automatic-watch}})
-
-    (exec! actor "h-unknown-op"
-           {:op :actuate-movement-line :effect :propose :subject "batch-001"})
-
-    (exec! actor "h-equipment-unverified"
-           {:op :schedule-maintenance :effect :propose :subject "mnt-2"
-            :value {:equipment-id "test-bench-002" :maintenance-type :calibration
-                    :scheduled-date "2026-08-01" :actuate-equipment? false}})
-
-    (exec! actor "h-batch-unverified"
-           {:op :coordinate-shipment :effect :propose :subject "ship-2"
-            :value {:batch-id "batch-003" :units 100.0
-                    :destination "buyer-yard-south"}})
-
-    (exec! actor "h-quantity-exceeded"
-           {:op :coordinate-shipment :effect :propose :subject "ship-3"
-            :value {:batch-id "batch-002" :units 100.0
-                    :destination "buyer-yard-east"}})
-
-    (exec! actor "h-actuate"
-           {:op :schedule-maintenance :effect :propose :subject "mnt-3"
-            :value {:equipment-id "assembly-001" :maintenance-type :force-run
-                    :scheduled-date "2026-09-01" :actuate-equipment? true}})
-
-    (exec! actor "h-double-schedule"
-           {:op :schedule-maintenance :effect :propose :subject "mnt-1"
-            :value {:equipment-id "assembly-001" :maintenance-type :regulation-calibration
-                    :scheduled-date "2026-08-01" :actuate-equipment? false}})
-
-    (exec! actor "h-product-type"
-           {:op :log-production-batch :effect :propose :subject "batch-001"
-            :patch {:product-type :unobtainium}})
-
-    (exec! actor "h-accuracy"
-           {:op :log-production-batch :effect :propose :subject "batch-001"
-            :patch {:accuracy-test-seconds-per-day 999999.0}})
-
-    (exec! actor "h-defect-rate"
-           {:op :log-production-batch :effect :propose :subject "batch-001"
-            :patch {:defect-rate-percent 999.0}})
-
-    (exec! actor "h-certification"
-           {:op :log-production-batch :effect :propose :subject "batch-001"
-            :patch {:issue-certification? true}})
-
-    db))
+    {:db db :runs (mapv #(drive! actor %) scenarios)}))
 
 ;; ----------------------------- html helpers -----------------------------
 
@@ -213,291 +210,359 @@
       (str/replace ">" "&gt;")
       (str/replace "\"" "&quot;")))
 
-(defn- label
-  "Render a ledger/basis value (keyword or string) as plain text."
+(defn- fmt
+  "Render a stored value, or an em dash when the domain model has no
+  value for that field on that record."
   [v]
-  (cond (keyword? v) (name v)
-        (nil? v) ""
-        :else (str v)))
+  (if (nil? v) "—" (esc v)))
 
-(defn- yes-no [b]
-  (if b "<span class=\"ok\">yes</span>" "<span class=\"err\">no</span>"))
+(defn- code [v] (str "<code>" (esc v) "</code>"))
 
-(defn- row [& cells]
-  (str "        <tr>" (apply str (map #(str "<td>" % "</td>") cells)) "</tr>"))
+(defn- numv [v]
+  (if (nil? v) "—" (str "<span class=\"num\">" (esc v) "</span>")))
+
+(defn- flag [v]
+  (if (true? v)
+    "<span class=\"ok\">true</span>"
+    (str "<span class=\"muted\">" (if (nil? v) "—" (esc v)) "</span>")))
+
+(defn- codes
+  "Render a SEQUENCE of keywords in the order the code produced it --
+  used for `:basis`, whose order is the governor's own evaluation
+  order."
+  [coll]
+  (str/join " " (map code coll)))
+
+(defn- kw-codes
+  "Render a SET of keywords. Sorted, because a set has no order and an
+  unsorted render would make the output non-deterministic."
+  [coll]
+  (str/join " " (map code (sort-by str coll))))
+
+(defn- tr [& cells] (str "<tr>" (apply str (map #(str "<td>" % "</td>") cells)) "</tr>"))
 
 (defn- table [headers rows]
-  (str "    <table>\n"
-       "      <thead><tr>"
+  (str "<table><thead><tr>"
        (apply str (map #(str "<th>" (esc %) "</th>") headers))
-       "</tr></thead>\n"
-       "      <tbody>\n"
-       (str/join "\n" rows) "\n"
-       "      </tbody>\n"
-       "    </table>\n"))
+       "</tr></thead><tbody>\n"
+       (str/join "\n" rows)
+       "\n</tbody></table>"))
 
-(defn- section [title lead body]
-  (str "  <section class=\"card\">\n"
-       "    <h2>" (esc title) "</h2>\n"
-       "    <p class=\"muted\">" lead "</p>\n"
-       body
-       "  </section>\n"))
+(defn- card [title note body]
+  (str "<section class=\"card\"><h2>" (esc title) "</h2>"
+       (when note (str "<p class=\"muted\">" note "</p>"))
+       body "</section>"))
 
-;; ----------------------------- derived views -----------------------------
+;; ----------------------------- sections -----------------------------
 
-(defn- hold? [f] (= :governor-hold (:t f)))
-(defn- rejected? [f] (= :approval-rejected (:t f)))
-(defn- committed? [f] (= :committed (:t f)))
+(defn- ledger-of [db] (vec (store/ledger db)))
 
-(defn- fact-detail
-  "The human-facing 'why' for one ledger fact -- the governor's own
-  violation details for a hold, the advisor's own summary for a commit."
-  [{:keys [violations summary]}]
-  (if (seq violations)
-    (str/join " / " (map :detail violations))
-    (str summary)))
+(defn- holds [db]
+  (filterv #(= :governor-hold (:t %)) (ledger-of db)))
 
-(defn- fact-disposition-cell [f]
+(defn- summary-section [db runs]
+  (let [led (ledger-of db)
+        n (fn [t] (count (filter #(= t (:t %)) led)))]
+    (card "Run summary"
+          (str "Every number below is a count over the actor's own append-only ledger "
+               "after driving " (count runs) " requests through "
+               (code "watchmfg.operation/build") ".")
+          (table ["Measure" "Count"]
+                 [(tr "requests driven" (numv (count runs)))
+                  (tr "ledger facts" (numv (count led)))
+                  (tr "commits" (numv (n :committed)))
+                  (tr "governor HARD holds" (numv (n :governor-hold)))
+                  (tr "human approvals" (numv (count (filter #(= :approved (:human %)) runs))))
+                  (tr "human rejections" (numv (count (filter #(= :rejected (:human %)) runs))))]))))
+
+(defn- verdict-cell [{:keys [verdict]}]
   (cond
-    (committed? f) "<span class=\"ok\">committed</span>"
-    (rejected? f) "<span class=\"warn\">approver rejected</span>"
-    (hold? f) "<span class=\"critical\">HARD hold</span>"
-    :else (str "<span class=\"muted\">" (esc (label (:t f))) "</span>")))
+    (nil? verdict) "<span class=\"muted\">—</span>"
+    (:hard? verdict)
+    (str "<span class=\"critical\">HARD</span> "
+         (str/join " " (map code (map :rule (:violations verdict)))))
+    (:escalate? verdict)
+    (str "<span class=\"warn\">escalate</span>"
+         (when (:high-stakes? verdict) " <span class=\"muted\">high-stakes</span>"))
+    :else (str "<span class=\"ok\">clean</span> <span class=\"muted\">conf "
+               (esc (:confidence verdict)) "</span>")))
 
-(defn- ledger-rows [ledger]
-  (map-indexed
-   (fn [i f]
-     (row (inc i)
-          (fact-disposition-cell f)
-          (str "<code>" (esc (label (:op f))) "</code>")
-          (esc (label (:subject f)))
-          (esc (str/join ", " (map label (:basis f))))
-          (esc (fact-detail f))))
-   ledger))
+(defn- human-cell [{:keys [approval human paused?]}]
+  (cond
+    (= :approved human) "<span class=\"ok\">approved</span>"
+    (= :rejected human) "<span class=\"critical\">rejected</span>"
+    (and approval (not paused?))
+    "<span class=\"muted\">never offered (no interrupt)</span>"
+    :else "<span class=\"muted\">—</span>"))
 
-(defn- batch-rows [db]
-  (map (fn [{:keys [id product-type model accuracy-test-seconds-per-day
-                    quantity-units shipped-units defect-rate-percent
-                    verified? registered? last-assessed]}]
-         (row (str "<code>" (esc id) "</code>")
-              (esc (label product-type))
-              (esc model)
-              (esc accuracy-test-seconds-per-day)
-              (esc quantity-units)
-              (esc shipped-units)
-              (esc defect-rate-percent)
-              (yes-no verified?)
-              (yes-no registered?)
-              (esc last-assessed)))
-       (store/all-batches db)))
+(defn- disposition-cell [{:keys [disposition]}]
+  (case disposition
+    :commit "<span class=\"ok\">commit</span>"
+    :hold "<span class=\"critical\">hold</span>"
+    :escalate "<span class=\"warn\">escalate</span>"
+    (str "<span class=\"muted\">" (fmt disposition) "</span>")))
 
-(defn- equipment-rows [db]
-  (map (fn [{:keys [id kind verified? registered?
-                    last-maintenance-date last-scheduled-maintenance-date]}]
-         (row (str "<code>" (esc id) "</code>")
-              (esc (label kind))
-              (yes-no verified?)
-              (yes-no registered?)
-              (if last-maintenance-date
-                (esc last-maintenance-date)
-                "<span class=\"muted\">never</span>")
-              (if last-scheduled-maintenance-date
-                (esc last-scheduled-maintenance-date)
-                "<span class=\"muted\">none</span>")))
-       (store/all-equipment db)))
+(defn- timeline-section [runs]
+  (card "Request timeline"
+        (str "One row = one <code>langgraph.graph/run*</code> over the compiled actor. "
+             "The governor column is the verdict map the governor itself returned; the human "
+             "column is the decision handed back to the graph while it was paused at "
+             (code ":request-approval") ".")
+        (table ["Thread" "Op" "Subject" "Governor" "Human" "Final" "What this exercises"]
+               (for [{:keys [tid request escalation exercises] :as r} runs]
+                 (tr (code tid)
+                     (code (:op request))
+                     (code (:subject request))
+                     (verdict-cell r)
+                     (human-cell r)
+                     (str (disposition-cell r)
+                          (when-let [reason (:reason escalation)]
+                            (str " <span class=\"muted\">after escalation "
+                                 (code reason) "</span>")))
+                     (str "<span class=\"muted\">" (esc exercises) "</span>"))))))
 
-(defn- gate-rows
-  "The gate table, derived from the actor's own code data
-  (`governor/allowed-ops`, `governor/high-stakes`, `phase/phases`) --
-  not a prose restatement of it. `phase` is whatever the scenario's
-  operator context actually ran under."
-  [ph]
-  (let [{:keys [writes auto]} (get phase/phases ph)]
-    (map (fn [o]
-           (row (str "<code>" (esc (label o)) "</code>")
-                (if (contains? writes o)
-                  "<span class=\"ok\">enabled</span>"
-                  "<span class=\"err\">disabled</span>")
-                (if (contains? auto o)
-                  "<span class=\"ok\">auto-commit when governor-clean</span>"
-                  "<span class=\"warn\">human approval required</span>")))
-         (sort-by label governor/allowed-ops))))
+(defn- holds-section [db]
+  (let [hs (holds db)]
+    (card "Governor HARD holds"
+          (str "Each row is a <code>:governor-hold</code> fact on the append-only ledger. The rule "
+               "name and the detail text are the governor's own "
+               (code ":violations") " entries — this page holds no rule text of its own.")
+          (table ["Rule" "Op" "Subject" "Confidence" "Governor's own detail"]
+                 (for [h hs
+                       v (:violations h)]
+                   (tr (str "<span class=\"critical\">" (esc (:rule v)) "</span>")
+                       (code (:op h))
+                       (code (:subject h))
+                       (numv (:confidence h))
+                       (esc (:detail v))))))))
 
-(defn- hold-reason-rows
-  "One row per distinct governor rule this run actually fired, with the
-  number of times it fired -- a frequency count over the real ledger."
-  [ledger]
-  (let [rules (frequencies (mapcat :basis (filter hold? ledger)))
-        detail-for (into {} (for [f (filter hold? ledger)
-                                  v (:violations f)]
-                              [(:rule v) (:detail v)]))]
-    (map (fn [[rule n]]
-           (row (str "<code>" (esc (label rule)) "</code>")
-                n
-                (esc (get detail-for rule ""))))
-         (sort-by (comp label key) rules))))
+(defn- rejections-section [db]
+  (let [rs (filterv #(= :approval-rejected (:t %)) (ledger-of db))]
+    (when (seq rs)
+      (card "Human rejections"
+            (str "A governor-clean proposal a person declined. Written to the ledger by the same "
+                 (code ":hold") " node, but with basis " (code ":approver-rejected") " — not a "
+                 "compliance violation.")
+            (table ["Op" "Subject" "Basis" "Confidence"]
+                   (for [r rs]
+                     (tr (code (:op r)) (code (:subject r))
+                         (codes (:basis r)) (numv (:confidence r)))))))))
 
-(defn- draft-rows [history keys*]
-  (map (fn [r] (apply row (map #(str "<code>" (esc (get r %)) "</code>") keys*)))
-       history))
+(defn- phase-section []
+  (let [ph phase/default-phase
+        {:keys [label writes auto]} (get phase/phases ph)]
+    (card (str "Rollout phase gate — phase " ph " (" label ")")
+          (str "Derived from " (code "watchmfg.phase/phases") ". A governor HOLD always stays a "
+               "HOLD; an op that may write but is not auto-eligible escalates to a human even when "
+               "the governor is clean.")
+          (table ["Op" "May write in this phase" "May auto-commit when governor-clean"]
+                 (for [o (sort-by str governor/allowed-ops)]
+                   (tr (code o)
+                       (if (contains? writes o)
+                         "<span class=\"ok\">yes</span>"
+                         "<span class=\"critical\">no — HOLD (:phase-disabled)</span>")
+                       (if (contains? auto o)
+                         "<span class=\"ok\">yes</span>"
+                         "<span class=\"warn\">no — always human approval</span>")))))))
 
-(defn- concern-rows [db]
-  (map (fn [{:keys [id equipment-id severity description approved-by]}]
-         (row (str "<code>" (esc id) "</code>")
-              (esc (label equipment-id))
-              (esc (label severity))
-              (esc description)
-              (if approved-by
-                (str "<span class=\"ok\">" (esc approved-by) "</span>")
-                "<span class=\"muted\">—</span>")))
-       (store/safety-concerns db)))
+(defn- governor-section []
+  (card "Governor configuration"
+        (str "Read straight off the public vars of " (code "watchmfg.governor") ".")
+        (table ["Setting" "Value"]
+               [(tr "confidence floor" (numv governor/confidence-floor))
+                (tr "allowed ops" (kw-codes governor/allowed-ops))
+                (tr "allowed proposal effects" (kw-codes governor/allowed-proposal-effects))
+                (tr "always-human stakes" (kw-codes governor/high-stakes))])))
+
+(defn- bounds-section []
+  (card "Independent ground-truth bounds"
+        (str "The values " (code "watchmfg.registry") " uses to re-derive the truth itself, "
+             "rather than believing the advisor's rationale.")
+        (table ["Bound" "Value"]
+               [(tr "valid product types" (kw-codes registry/valid-product-types))
+                (tr "accuracy test (s/day)"
+                    (str (numv registry/accuracy-test-seconds-per-day-min) " … "
+                         (numv registry/accuracy-test-seconds-per-day-max)))
+                (tr "defect rate (%)"
+                    (str (numv registry/defect-rate-min-percent) " … "
+                         (numv registry/defect-rate-max-percent)))])))
+
+(defn- last-fact-for [led subject]
+  (last (filter #(= subject (:subject %)) led)))
+
+(defn- subject-status [led subject]
+  (let [f (last-fact-for led subject)]
+    (cond
+      (nil? f) "<span class=\"muted\">no ledger activity</span>"
+      (= :committed (:t f)) "<span class=\"ok\">committed</span>"
+      (= :approval-rejected (:t f)) "<span class=\"critical\">rejected by approver</span>"
+      (= :governor-hold (:t f))
+      (str "<span class=\"critical\">HARD hold</span> " (codes (:basis f)))
+      :else (str "<span class=\"muted\">" (esc (:t f)) "</span>"))))
+
+(defn- remaining [b]
+  (let [q (:quantity-units b) s (:shipped-units b 0.0)]
+    (when (and (number? q) (number? s)) (- (double q) (double s)))))
+
+(defn- batches-section [db]
+  (let [led (ledger-of db)]
+    (card "Production batches"
+          (str "Read back from " (code "watchmfg.store/all-batches") " after the run. "
+               (code "batch-001") " " (code "batch-002") " " (code "batch-003")
+               " are seeded by " (code "store/sample-data!") "; " (code "batch-004")
+               " exists because the <code>t01</code> intake op committed it. "
+               "A field the record does not carry shows as —; "
+               (code "batch-004") " has no " (code ":shipped-units") " of its own yet, so "
+               "<em>Remaining</em> uses the same <code>0.0</code> default "
+               (code "watchmfg.registry") " itself applies when it recomputes headroom.")
+          (table ["Batch" "Product type" "Model" "Accuracy (s/day)" "Quantity (units)"
+                  "Shipped (units)" "Remaining" "Defect rate (%)" "verified?" "registered?"
+                  "ready?" "Last assessed" "Ledger status"]
+                 (for [b (store/all-batches db)]
+                   (tr (code (:id b)) (fmt (:product-type b)) (fmt (:model b))
+                       (numv (:accuracy-test-seconds-per-day b)) (numv (:quantity-units b))
+                       (numv (:shipped-units b)) (numv (remaining b))
+                       (numv (:defect-rate-percent b))
+                       (flag (:verified? b)) (flag (:registered? b))
+                       (if (registry/batch-ready? b)
+                         "<span class=\"ok\">yes</span>" "<span class=\"critical\">no</span>")
+                       (fmt (:last-assessed b))
+                       (subject-status led (:id b))))))))
+
+(defn- equipment-section [db]
+  (card "Movement-assembly / testing equipment"
+        (str "Read back from " (code "watchmfg.store/all-equipment") ". Equipment ids are never "
+             "a request <code>:subject</code> in this domain (a maintenance draft id is), so no "
+             "ledger-status column is shown for them — "
+             (code ":last-scheduled-maintenance-date") " is the field the commit path actually "
+             "writes onto an equipment record.")
+        (table ["Unit" "Kind" "verified?" "registered?" "ready?" "Last maintenance"
+                "Last scheduled maintenance" "Maintenance drafts on file"]
+               (for [e (store/all-equipment db)]
+                 (tr (code (:id e)) (fmt (:kind e))
+                     (flag (:verified? e)) (flag (:registered? e))
+                     (if (registry/equipment-ready? e)
+                       "<span class=\"ok\">yes</span>" "<span class=\"critical\">no</span>")
+                     (fmt (:last-maintenance-date e))
+                     (fmt (:last-scheduled-maintenance-date e))
+                     (numv (count (filter #(= (:id e) (:equipment-id %))
+                                         (store/all-maintenance db)))))))))
+
+(defn- maintenance-section [db]
+  (let [ms (store/all-maintenance db)]
+    (card "Maintenance schedule drafts"
+          (str "Committed drafts from " (code "watchmfg.store/all-maintenance") ". The "
+               "maintenance number is minted by " (code "watchmfg.registry/register-maintenance")
+               " at commit time. Nothing here actuates any equipment.")
+          (if (seq ms)
+            (table ["Draft" "Equipment" "Type" "Scheduled date" "actuate-equipment?"
+                    "scheduled?" "Maintenance number"]
+                   (for [m ms]
+                     (tr (code (:id m)) (code (:equipment-id m)) (fmt (:maintenance-type m))
+                         (fmt (:scheduled-date m)) (flag (:actuate-equipment? m))
+                         (flag (:scheduled? m)) (fmt (:maintenance-number m)))))
+            "<p class=\"muted\">none committed in this run</p>"))))
+
+(defn- shipments-section [db]
+  (let [hist (store/shipment-history db)
+        ships (keep #(store/shipment db (get % "shipment_id")) hist)]
+    (card "Shipment coordination drafts"
+          (str "Committed drafts, joined from " (code "watchmfg.store/shipment-history")
+               " back to each stored shipment record. This is a draft a coordinator keeps — it "
+               "dispatches no freight carrier.")
+          (if (seq ships)
+            (table ["Draft" "Batch" "Units" "Destination" "Shipment number"]
+                   (for [s ships]
+                     (tr (code (:id s)) (code (:batch-id s)) (numv (:units s))
+                         (fmt (:destination s)) (fmt (:shipment-number s)))))
+            "<p class=\"muted\">none committed in this run</p>"))))
+
+(defn- concerns-section [db]
+  (let [cs (store/safety-concerns db)]
+    (card "Safety concerns"
+          (str "The append-only safety-concern log (" (code "watchmfg.store/safety-concerns")
+               "). A concern may be raised against any equipment, verified or not — it is never "
+               "blocked on an administrative technicality.")
+          (if (seq cs)
+            (table ["Concern" "Equipment" "Severity" "Description"]
+                   (for [c cs]
+                     (tr (code (:id c)) (code (:equipment-id c)) (fmt (:severity c))
+                         (fmt (:description c)))))
+            "<p class=\"muted\">none flagged in this run</p>"))))
+
+(defn- ledger-section [db]
+  (card "Audit ledger (append-only)"
+        (str "The full ledger, in append order, exactly as "
+             (code "watchmfg.store/ledger") " returns it.")
+        (table ["#" "Fact" "Op" "Subject" "Actor" "Disposition" "Basis"]
+               (map-indexed
+                (fn [i f]
+                  (tr (numv (inc i))
+                      (let [cls (case (:t f)
+                                  :committed "ok"
+                                  :governor-hold "critical"
+                                  :approval-rejected "critical"
+                                  "muted")]
+                        (str "<span class=\"" cls "\">" (esc (:t f)) "</span>"))
+                      (code (:op f)) (code (:subject f)) (fmt (:actor f))
+                      (fmt (:disposition f)) (codes (:basis f))))
+                (ledger-of db)))))
 
 ;; ----------------------------- page -----------------------------
 
 (defn render
-  "Renders the whole operator-console document from a store `db` that
-  has already been driven by `run-demo!` (or any other real scenario)."
-  [db]
-  (let [ledger (vec (store/ledger db))
-        ph (:phase coordinator)
-        phase-label (:label (get phase/phases ph))
-        holds (count (filter hold? ledger))
-        commits (count (filter committed? ledger))
-        rejects (count (filter rejected? ledger))]
-    (str
-     "<!doctype html>\n"
-     "<html lang=\"ja\"><head><meta charset=\"utf-8\">\n"
-     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-     "<title>cloud-itonami-isic-2652 · watch &amp; clock plant operations — Operator Console</title>\n"
-     "<style>\n" (jp-go-dds.skin/dds+skin) "\n</style>\n"
-     "</head><body>\n"
-     "<header class=\"bar\">\n"
-     "  <h1>時計・クロック製造 プラント運用 (ISIC 2652) — Operator Console</h1>\n"
-     "  <p class=\"badge\">read-only sample · governor-gated · 設備の直接操作(actuate)と精度認証(COSC等)の自己発行は恒久的に禁止</p>\n"
-     "</header>\n"
-     "<main>\n"
-
-     (section
-      "この画面について"
-      (str "この HTML は手書きではなく、<code>clojure -M:dev:render-html</code> が"
-           " 実際の actor スタック(<code>watchmfg.operation</code> の langgraph StateGraph"
-           " → <code>watchmfg.governor</code> → <code>watchmfg.phase</code>"
-           " → <code>watchmfg.store</code>)を 1 回走らせ、その結果の SSoT と"
-           " append-only 台帳から生成したもの。数値・ID・判定・却下理由はすべて"
-           " 実行結果の読み出しであり、固定文字列ではない。時刻を含まないため"
-           " 同じ seed からの再実行はバイト一致する。")
-      (table ["rollout phase" "committed" "HARD holds" "approver rejections" "ledger facts"]
-             [(row (str "<code>" ph "</code> " (esc phase-label))
-                   (str "<span class=\"ok\">" commits "</span>")
-                   (str "<span class=\"critical\">" holds "</span>")
-                   (str "<span class=\"warn\">" rejects "</span>")
-                   (count ledger))]))
-
-     (section
-      "生産バッチ (SSoT, 実行後の状態)"
-      (str "<code>watchmfg.store/all-batches</code> の実値。batch-001 の"
-           " <code>shipped-units</code> は承認済み出荷 ship-1 が実際に動かした結果で、"
-           " seed 値ではない。")
-      (table ["batch" "product-type" "model" "精度試験 s/day" "生産数量"
-              "出荷済み" "不良率 %" "verified?" "registered?" "last-assessed"]
-             (batch-rows db)))
-
-     (section
-      "設備ユニット (SSoT, 実行後の状態)"
-      (str "<code>watchmfg.store/all-equipment</code> の実値。"
-           " <code>verified?</code> / <code>registered?</code> は governor が"
-           " 提案の自己申告ではなく設備記録そのものから独立に再検証する接地点。")
-      (table ["equipment" "kind" "verified?" "registered?"
-              "last-maintenance" "last-scheduled-maintenance"]
-             (equipment-rows db)))
-
-     (section
-      (str "アクションゲート (phase " ph " / " phase-label ")")
-      (str "<code>watchmfg.governor/allowed-ops</code> と"
-           " <code>watchmfg.phase/phases</code> から導出。"
-           " <code>:schedule-maintenance</code> はどの phase の <code>:auto</code>"
-           " 集合にも属さない構造的事実であり、governor が通しても必ず人間に上がる。"
-           " confidence floor = <code>" governor/confidence-floor "</code>、"
-           " 常時 high-stakes = <code>"
-           (esc (str/join ", " (map label (sort-by label governor/high-stakes))))
-           "</code>。commit 可能な effect は <code>"
-           (esc (str/join ", " (map label (sort-by label governor/allowed-proposal-effects))))
-           "</code> の 4 つに閉じている。")
-      (table ["op" "この phase で書き込み可?" "自動コミット可?"] (gate-rows ph)))
-
-     (section
-      "この実行で実際に発火した HARD hold"
-      (str "台帳の <code>:governor-hold</code> facts の <code>:basis</code> を集計した実測値。"
-           " HARD hold は人間に上がらず、phase でも承認でも上書きできない。")
-      (table ["governor rule" "発火回数" "governor 自身が書いた detail (最後の 1 件)"]
-             (hold-reason-rows ledger)))
-
-     (section
-      "起票されたドラフト記録 (commit された分のみ)"
-      (str "<code>watchmfg.registry</code> が構築した DRAFT。"
-           " 実際の設備操作でも運送手配でもなく、コーディネーターが保持する記録。"
-           " 採番は時刻ではなく単調な連番なので決定的。")
-      (str (table ["maintenance record" "kind" "maintenance_id" "equipment_id"]
-                  (draft-rows (store/maintenance-history db)
-                              ["record_id" "kind" "maintenance_id" "equipment_id"]))
-           (table ["shipment record" "kind" "shipment_id"]
-                  (draft-rows (store/shipment-history db)
-                              ["record_id" "kind" "shipment_id"]))))
-
-     (section
-      "安全懸念ログ (append-only)"
-      (str "<code>:flag-safety-concern</code> は常に"
-           " <code>:coordination/safety-concern</code> stake を持ち、confidence に"
-           " かかわらず必ず人間に上がる。承認された懸念だけがここに残る"
-           " (却下された concern-2 は SSoT に書かれず、台帳に"
-           " <code>:approval-rejected</code> として残る)。")
-      (table ["concern" "equipment" "severity" "内容" "承認者"] (concern-rows db)))
-
-     (section
-      "監査台帳 (この実行の全 facts)"
-      (str "append-only の決定事実ログ。commit / HARD hold / 承認者却下 が"
-           " 発生順に並ぶ。<code>watchmfg.store/ledger</code> の実値。")
-      (table ["#" "disposition" "op" "subject" "basis" "detail"]
-             (ledger-rows ledger)))
-
-     "</main>\n"
-     "<footer>\n"
-     "  <p>cloud-itonami-isic-2652 · watch &amp; clock plant operations coordination actor ·\n"
-     "     generated by <code>watchmfg.render-html</code> from a real actor run.</p>\n"
-     "</footer>\n"
-     "</body></html>\n")))
-
-;; ----------------------------- entry point -----------------------------
-
-(def ^:private default-out "docs/samples/operator-console.html")
+  "The whole page, from the post-run store and the run log."
+  [{:keys [db runs]}]
+  (str "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
+       "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+       "<meta name=\"color-scheme\" content=\"light\">"
+       "<title>Operator console — cloud-itonami-isic-2652 (watchmfg)</title>"
+       "<style>" (jp-go-dds.skin/dds+skin) "</style></head>\n<body>\n"
+       "<header class=\"bar\">"
+       "<span class=\"badge\">ISIC 2652</span>"
+       "<span class=\"badge\">watchmfg</span>"
+       "<h1>Watch &amp; clock plant operations — operator console</h1>"
+       "</header>\n"
+       "<p class=\"subtitle\">governor "
+       (code "watch-clock-plant-operations-governor") " · actor "
+       (esc (:actor-id coordinator)) " · role " (esc (:actor-role coordinator))
+       " · phase " (esc (:phase coordinator))
+       "</p>\n<main>\n"
+       (str/join "\n"
+                 (remove nil?
+                         [(summary-section db runs)
+                          (timeline-section runs)
+                          (holds-section db)
+                          (rejections-section db)
+                          (phase-section)
+                          (governor-section)
+                          (bounds-section)
+                          (batches-section db)
+                          (equipment-section db)
+                          (maintenance-section db)
+                          (shipments-section db)
+                          (concerns-section db)
+                          (ledger-section db)]))
+       "\n</main>\n<footer>"
+       "Generated at build time by <code>watchmfg.render-html</code> "
+       "(<code>clojure -M:dev:render-html</code>) by driving the real "
+       "<code>watchmfg.operation</code> actor graph over the real "
+       "<code>watchmfg.store</code> seed. Deterministic — no clock, no randomness, no network. "
+       "No usage, revenue or performance metric is claimed anywhere on this page."
+       "</footer>\n</body>\n</html>\n"))
 
 (defn -main [& args]
-  (let [out (or (first args) default-out)
-        db (run-demo!)
-        ledger (vec (store/ledger db))
-        holds (filterv hold? ledger)]
-    ;; Build-time invariant, not a convention: this console exists to
-    ;; show that HARD governor violations never reach a human. A page
-    ;; rendered from a run where the governor never fired would be a
-    ;; demo of nothing, so refuse to write it.
-    (when (zero? (count holds))
-      (throw (ex-info
-              (str "render-html refused to write " out
-                   ": the scenario produced ZERO :governor-hold ledger facts. "
-                   "This console's whole claim is that HARD violations never reach "
-                   "a human, so it must be rendered from a run where the governor "
-                   "actually held something. Fix watchmfg.render-html/run-demo! "
-                   "(or the governor) before regenerating.")
-              {:out out
-               :ledger-facts (count ledger)
-               :governor-holds 0})))
-    (io/make-parents out)
-    (spit out (render db))
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        {:keys [db runs] :as result} (run-demo!)
+        hs (holds db)]
+    ;; A console that shows no real HARD hold is not evidence of a governor.
+    (when (empty? hs)
+      (throw (ex-info "no :governor-hold fact on the ledger — refusing to write a console that shows no real hold"
+                      {:ledger-facts (count (store/ledger db))})))
+    (let [f (java.io.File. ^String out)]
+      (when-let [p (.getParentFile f)] (.mkdirs p))
+      (spit f (render result)))
     (println "wrote" out
-             (str "(" (count ledger) " ledger facts, "
-                  (count (filter committed? ledger)) " committed, "
-                  (count holds) " HARD holds, "
-                  (count (filter rejected? ledger)) " approver rejections, "
-                  (count (store/maintenance-history db)) " maintenance drafts, "
-                  (count (store/shipment-history db)) " shipment drafts, "
-                  (count (store/safety-concerns db)) " safety concerns)"))))
+             (str "(" (count (store/ledger db)) " ledger facts, "
+                  (count hs) " HARD holds, "
+                  (count runs) " requests)"))))
