@@ -7,7 +7,7 @@
   This namespace drives the REAL actor stack -- `watchmfg.operation`
   (a langgraph-clj StateGraph) -> `watchmfg.governor` ->
   `watchmfg.phase` -> `watchmfg.store` -- through a scenario adapted
-  from this repo's own `watchmfg.sim` demo driver (`clojure -M:dev:run`,
+  from this repo's own `watchmfg.sim` demo driver (`kbb -M:dev:run`,
   run and read BEFORE writing this file, so the ids below are this
   repo's OWN seeded ids: batches `batch-001`..`batch-003`, equipment
   `assembly-001` / `test-bench-002`). Every id, number, disposition and
@@ -43,7 +43,7 @@
   demo of nothing. Making it a throw (precedent: cloud-itonami-isic-2513)
   turns that from a convention into something the build enforces.
 
-  Usage: `clojure -M:dev:render-html [out-file]`
+  Usage: `kbb -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
   (:require [clojure.java.io :as io]
             [kotoba.lang.text :as str]
@@ -379,7 +379,7 @@
 
      (section
       "この画面について"
-      (str "この HTML は手書きではなく、<code>clojure -M:dev:render-html</code> が"
+      (str "この HTML は手書きではなく、<code>kbb -M:dev:render-html</code> が"
            " 実際の actor スタック(<code>watchmfg.operation</code> の langgraph StateGraph"
            " → <code>watchmfg.governor</code> → <code>watchmfg.phase</code>"
            " → <code>watchmfg.store</code>)を 1 回走らせ、その結果の SSoT と"
