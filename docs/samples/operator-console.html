@@ -2475,7 +2475,7 @@ img,svg { max-width: 100%; height: auto; }
 <main>
   <section class="card">
     <h2>この画面について</h2>
-    <p class="muted">この HTML は手書きではなく、<code>clojure -M:dev:render-html</code> が 実際の actor スタック(<code>watchmfg.operation</code> の langgraph StateGraph → <code>watchmfg.governor</code> → <code>watchmfg.phase</code> → <code>watchmfg.store</code>)を 1 回走らせ、その結果の SSoT と append-only 台帳から生成したもの。数値・ID・判定・却下理由はすべて 実行結果の読み出しであり、固定文字列ではない。時刻を含まないため 同じ seed からの再実行はバイト一致する。</p>
+    <p class="muted">この HTML は手書きではなく、<code>kbb -M:dev:render-html</code> が 実際の actor スタック(<code>watchmfg.operation</code> の langgraph StateGraph → <code>watchmfg.governor</code> → <code>watchmfg.phase</code> → <code>watchmfg.store</code>)を 1 回走らせ、その結果の SSoT と append-only 台帳から生成したもの。数値・ID・判定・却下理由はすべて 実行結果の読み出しであり、固定文字列ではない。時刻を含まないため 同じ seed からの再実行はバイト一致する。</p>
     <table>
       <thead><tr><th>rollout phase</th><th>committed</th><th>HARD holds</th><th>approver rejections</th><th>ledger facts</th></tr></thead>
       <tbody>
