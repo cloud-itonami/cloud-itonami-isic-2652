@@ -4,6 +4,11 @@
 ;; repository. :deps only -- no :paths, so this file adds a dependency and
 ;; chooses no classpath.
 {:deps {
+        ;; kotoba.io replaced clojure.java.io here (2026-09-24). An explicit floor:
+        ;; kotoba.io carries clojure.java.io's file/as-file/as-relative-path/
+        ;; make-parents/delete-file from 98045c7, and tools.deps takes the NEWEST
+        ;; sha it is shown.
+        io.github.kotoba-lang/io {:git/sha "1b60ca825c1e705bd195f857ca4549133653a9f3"}
         ;; kotoba.robotics.process: the process-physics solvers and probe this
         ;; repo's physics.edn runs on (physical-AI bot, scripts/physical-ai-bots).
         io.github.kotoba-lang/robotics {:local/root "../../kotoba-lang/robotics"}
