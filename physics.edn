@@ -1,0 +1,32 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README: the ISIC 2652 plant assembles, cases, regulates and rate-tests
+;; watch and clock movements against a reference timebase. The robots'
+;; physical work: moving a cased watch / clock between rate-test temperature
+;; stations and waiting until the movement has actually reached the station
+;; temperature, and placing a movement into its case.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-2652"
+ :cases
+ [{:id :rate-test-temperature-step
+   :kind :thermal
+   :procedure "a cased movement moved from the 23 C rate-test station into the 38 C station must reach 37.8 C before its rate is read (steel/brass case and movement lumped as a half-slab, still air)"
+   :params {:conductivity-w-mk 50.0 :density-kg-m3 8200.0 :specific-heat-j-kgk 450.0
+            :t0-c 23.0 :t-hot-c 38.0 :h-front-w-m2k 10.0 :h-back-w-m2k 0.0
+            :threshold-c 37.8 :duration-s 40000.0 :nodes 3}
+   :sweep {:param :thickness-m :values [0.002 0.004 0.006 0.010 0.015]}
+   :quantity :time-to-threshold-s
+   :limit {:max 7200.0 :basis "estimate: a 2-hour settling slot per temperature station; the 23/38 C station pair follows the chronometer test temperatures of ISO 3159, the slot length does not come from it"}
+   :boundary {:lo 0.001 :hi 0.03}}
+  {:id :movement-into-case
+   :kind :manipulator
+   :procedure "small arm places a movement (watch to mantel-clock size) into its case"
+   :params {:l1-m 0.20 :l2-m 0.15 :m1-kg 1.0 :m2-kg 0.6
+            :from [0.25 0.05] :to [0.10 0.22] :duration-s 1.0 :steps 400}
+   :sweep {:param :payload-kg :values [0.01 0.05 0.15 0.30 0.60]}
+   :quantity :peak-tau1-nm
+   :limit {:max 3.0 :basis "estimate: rated shoulder torque of a desktop precision-assembly arm"}
+   :boundary {:lo 0.001 :hi 5.0}}]}
